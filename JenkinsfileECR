@@ -1,0 +1,176 @@
+#!groovy
+
+import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
+
+// search chart list
+def SEARCH_LIST = [
+    "test-search1",
+    "test-search2"
+]
+
+// function: image search, pull and push
+def search (SUBFOLDER, SEARCH_LIST, ECR_URL, TGT_PREFIX, SRC_PREFIX) {
+    sh """
+        set +x
+        cd ${SUBFOLDER}
+        rm -f chartlist 
+        touch chartlist
+    """
+    SEARCH_LIST.each { CHART ->
+        sh """
+            cd ${SUBFOLDER}
+            helm template ${CHART} | yq -r '.spec | .template | .spec | .containers | .[] .image' >> chartlist
+        """
+    }
+
+    def CHECK_LIST = sh (
+        script: """
+            set +x
+            cd ${SUBFOLDER}
+            sort -u chartlist > imagelist
+            cat imagelist
+        """,
+        returnStdout: true
+    ).trim()
+    
+    sh """
+        set +x
+        aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin ${ECR_URL}
+    """
+
+    CHECK_LIST.split('\n').each { IMAGE_INFO ->
+        if (IMAGE_INFO?.trim()) {
+            def (NAME, TAG) = "${IMAGE_INFO}".split(':')
+            if (NAME?.trim() && TAG?.trim()) {
+                def SRC_NAME = "${NAME}".replaceAll("^${TGT_PREFIX}/", "${SRC_PREFIX}/")
+                def CHECK = sh (
+                    script: """
+                        set +x
+                        aws ecr describe-images --repository-name=${NAME} --image-ids=imageTag=${TAG} 1>/dev/null
+                    """,
+                    returnStatus: true
+                )
+                if (CHECK == 0) {
+                    println("${NAME}:${TAG} exist - passed")
+                } else {
+                    sh """
+                        set +x
+                        docker pull ${ECR_URL}/${SRC_NAME}:${TAG}
+                        docker tag ${ECR_URL}/${SRC_NAME}:${TAG} ${ECR_URL}/${NAME}:${TAG}
+                        docker push ${ECR_URL}/${NAME}:${TAG}
+                        docker rmi ${ECR_URL}/${NAME}:${TAG}
+                        docker rmi ${ECR_URL}/${SRC_NAME}:${TAG}
+                    """
+                    println("image copy ${SRC_NAME}:${TAG} to ${NAME}:${TAG}")
+                }
+            }
+        }
+    }
+}
+
+node {
+
+    // Code Git - gitlab webhook
+    def CONFIG_GIT_ACTION_TYPE = env.gitlabActionType
+    def CONFIG_GIT_MERGE_REQUEST_STATE = env.gitlabMergeRequestState
+    def CONFIG_GIT_SOURCE_REPO_URL = env.gitlabSourceRepoURL
+    def CONFIG_GIT_TARGET_BRANCH = env.gitlabTargetBranch
+
+    def IS_ABORTED = false // job build 중지 여부
+    def IS_PREVIOUS_ABORTED = false // 이전 job build 중지 여부
+    def IS_STAGE = false // 스테이징 여부 - S3
+    def IS_PROD = false // 운영 여부 - S3
+    def SRC_PREFIX = "" // 이미지 가져올 ECR repo prefix
+    def TGT_PREFIX = "" // 이미지 있는지 확인할 ECR repo prefix
+
+    if (CONFIG_GIT_ACTION_TYPE ==~ ~'^MERGE$') {
+        // merge_request event - merged 상태면 타겟 브런치 확인
+        if (CONFIG_GIT_MERGE_REQUEST_STATE  ==~ ~'^merged$') {
+            if (CONFIG_GIT_TARGET_BRANCH ==~ ~'^stage$') { // stage 브런치
+                IS_STAGE = true
+                SRC_PREFIX = "dev"
+                TGT_PREFIX = "stg"
+            } else if (CONFIG_GIT_TARGET_BRANCH ==~ ~'^prod$') { // prod 브런치
+                IS_PROD = true
+                SRC_PREFIX = "stg"
+                TGT_PREFIX = "prod"
+            } else {  // 그 외 브런치는 중지
+                IS_ABORTED = true
+            }
+        } else {
+            // merge_request event - merged 상태 아니면 중지
+            IS_ABORTED = true
+        }
+    } else {
+        // merge_request event 아니면 중지
+        IS_ABORTED = true
+    }
+
+    // 중지 처리
+    if (IS_ABORTED) {
+        currentBuild.result = 'ABORTED'
+        error('build aborted')
+    }
+
+    // 이전 빌드 중지 처리
+    if (IS_PREVIOUS_ABORTED) {
+        def buildNumber = env.BUILD_NUMBER as int
+        if (buildNumber > 1) {
+            milestone(buildNumber - 1)
+        }
+        milestone(buildNumber)
+    }
+
+    // workspace clean
+    sh """
+        rm -rf *
+    """
+
+    // Code GIt
+    def CONFIG_GIT_CREDENTIAL_ID = "jenkins-ssh-key" // config repo ssh key credential
+    def CONFIG_GIT_SUBFOLDER = "config" // config repo checkout sub-directory
+
+    // ECR
+    def AWS_ID = "148758220912"
+    def ECR_URL = "${AWS_ID}.dkr.ecr.ap-northeast-2.amazonaws.com"
+
+    // Code Checkout
+    stage('Checkout') {
+        dir (CONFIG_GIT_SUBFOLDER) {
+            configGit = git(branch: CONFIG_GIT_TARGET_BRANCH, credentialsId: CONFIG_GIT_CREDENTIAL_ID, url: CONFIG_GIT_SOURCE_REPO_URL)
+        }
+    }
+
+    // STAGE - IMAGE CHECK
+    stage('STAGE - IMAGE CHECK') {
+        if (IS_STAGE) {
+            search(CONFIG_GIT_SUBFOLDER, SEARCH_LIST, ECR_URL, TGT_PREFIX, SRC_PREFIX)
+            println("STAGE - ECR repo checked")
+        } else {
+            println("STAGE - ECR repo check passed")
+            // stage skip
+            Utils.markStageSkippedForConditional('STAGE - IMAGE CHECK')
+        }
+    }
+
+    // PROD - IMAGE CHECK
+    stage('PROD - IMAGE CHECK') {
+        if (IS_PROD) {
+            search(CONFIG_GIT_SUBFOLDER, SEARCH_LIST, ECR_URL, TGT_PREFIX, SRC_PREFIX)
+            println("PROD - ECR repo checked")
+        } else {
+            println("PROD - ECR repo check passed")
+            // stage skip
+            Utils.markStageSkippedForConditional('PROD - IMAGE CHECK')
+        }
+    }
+
+    // Jenkins Workspace Clean
+    sh """
+        rm -rf *
+        rm -rf ../${env.JOB_BASE_NAME}@libs
+        rm -rf ../${env.JOB_BASE_NAME}@script
+    """
+    cleanWs()
+
+}

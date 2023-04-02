@@ -1,0 +1,19 @@
+stages:
+  - merge
+
+merege-job:
+  stage: merge
+  script:
+    - echo $CI_API_V4_URL
+    - echo $CI_MERGE_REQUEST_PROJECT_ID
+    - echo $CI_MERGE_REQUEST_IID
+    - export API_URL=$CI_API_V4_URL/projects/$CI_MERGE_REQUEST_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/merge
+    - echo $API_URL
+    - 'curl --request PUT --header "PRIVATE-TOKEN: $API_TOKEN" "$API_URL"'
+#    - 'curl --silent --request PUT --header "PRIVATE-TOKEN: $API_TOKEN" "$API_URL" 1>/dev/null'
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+        && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == 'main'
+        && $CI_MERGE_REQUEST_LABELS == 'auto-merge'
+  tags:
+    - TEST
