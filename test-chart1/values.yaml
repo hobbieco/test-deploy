@@ -5,10 +5,10 @@
 replicaCount: 1
 
 image:
-  repository: stg/alpine
+  repository: nginx
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "tag-1"
+  tag: "stable-alpine-slim"
 
 imagePullSecrets: []
 nameOverride: ""
