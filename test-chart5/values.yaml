@@ -22,7 +22,7 @@ global:
 
 ## @param kubeVersion Override Kubernetes version
 ##
-kubeVersion: ""
+kubeVersion: "1.23"
 ## @param nameOverride String to partially override common.names.fullname template (will maintain the release name)
 ##
 nameOverride: ""
